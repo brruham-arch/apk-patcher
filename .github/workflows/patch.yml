@@ -32,11 +32,11 @@ jobs:
           echo 'java -jar /usr/local/bin/apktool.jar "$@"' >> /usr/local/bin/apktool
           chmod +x /usr/local/bin/apktool
 
-      - name: Download Frida Gadget (armeabi-v7a)
+      - name: Download Frida Gadget armeabi-v7a
         run: |
           FRIDA_VER=$(curl -s https://api.github.com/repos/frida/frida/releases/latest \
             | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
-          echo "Frida version: $FRIDA_VER"
+          echo "Frida: $FRIDA_VER"
           curl -L -o frida-gadget.so.xz \
             "https://github.com/frida/frida/releases/download/${FRIDA_VER}/frida-gadget-${FRIDA_VER}-android-arm.so.xz"
           xz -d frida-gadget.so.xz
@@ -48,84 +48,85 @@ jobs:
 
       - name: Inject loadLibrary ke SplashActivity
         run: |
-          python3 << 'PYTHON'
-          import os
+          python3 - << 'PYTHON'
+          import os, re
 
           target = "decompiled/smali/com/sampmobilerp/launcher/SplashActivity.smali"
 
-          if not os.path.exists(target):
-              print(f"ERROR: {target} tidak ditemukan!")
-              exit(1)
+          with open(target, 'r') as f:
+              lines = f.readlines()
+
+          in_oncreate = False
+          locals_line_idx = -1
+          locals_count = 0
+          super_line_idx = -1
+
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+
+              if '.method' in stripped and 'onCreate' in stripped and 'Bundle' in stripped:
+                  in_oncreate = True
+
+              if in_oncreate and '.locals' in stripped and locals_line_idx == -1:
+                  locals_line_idx = i
+                  locals_count = int(re.search(r'\.locals\s+(\d+)', stripped).group(1))
+
+              if in_oncreate and 'invoke-super' in stripped and 'onCreate' in stripped:
+                  super_line_idx = i
+
+              if in_oncreate and '.end method' in stripped:
+                  in_oncreate = False
+
+          print(f"locals: {locals_count}, super at line: {super_line_idx}")
+
+          reg = f"v{locals_count}"
+          new_locals = locals_count + 1
+
+          lines[locals_line_idx] = f"    .locals {new_locals}\n"
+
+          inject_lines = [
+              "\n",
+              f"    const-string {reg}, \"frida-gadget\"\n",
+              f"    invoke-static {{{reg}}}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n",
+          ]
+          for j, l in enumerate(inject_lines):
+              lines.insert(super_line_idx + 1 + j, l)
+
+          with open(target, 'w') as f:
+              f.writelines(lines)
 
           with open(target, 'r') as f:
               content = f.read()
-
-          # Inject tepat setelah invoke-super onCreate yang spesifik ini
-          SUPER_LINE = "    invoke-super {p0, p1}, Landroidx/fragment/app/v;->onCreate(Landroid/os/Bundle;)V"
-          INJECT = (
-              "\n"
-              "    # >>> Frida Gadget injection <<<\n"
-              '    const-string v0, "frida-gadget"\n'
-              "    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n"
-              "    # >>> End injection <<<\n"
-          )
-
-          if SUPER_LINE not in content:
-              print("ERROR: invoke-super target tidak ditemukan di smali!")
-              print("Coba cari manual...")
-              # Fallback: cari invoke-super onCreate apapun
-              import re
-              matches = re.findall(r'    invoke-super.*->onCreate.*', content)
-              print(f"invoke-super onCreate yang ada: {matches}")
-              exit(1)
-
           if 'frida-gadget' in content:
-              print("WARNING: frida-gadget sudah ada di smali, skip inject")
+              print(f"[+] OK! locals {locals_count}->{new_locals}, reg {reg}")
           else:
-              new_content = content.replace(SUPER_LINE, SUPER_LINE + INJECT, 1)
-              with open(target, 'w') as f:
-                  f.write(new_content)
-              print(f"[+] Inject berhasil setelah invoke-super onCreate!")
-
-          # Verifikasi
-          with open(target, 'r') as f:
-              verify = f.read()
-          if 'frida-gadget' in verify:
-              print("[+] Verifikasi OK!")
-          else:
-              print("[-] Verifikasi GAGAL!")
+              print("[-] GAGAL!")
               exit(1)
           PYTHON
+
+      - name: Preview inject
+        run: |
+          grep -n -B2 -A3 "frida-gadget" \
+            decompiled/smali/com/sampmobilerp/launcher/SplashActivity.smali
 
       - name: Copy Frida Gadget ke lib
         run: |
           mkdir -p decompiled/lib/armeabi-v7a
           cp libfrida-gadget.so decompiled/lib/armeabi-v7a/libfrida-gadget.so
-          ls -la decompiled/lib/armeabi-v7a/
 
       - name: Setup Frida config
         run: |
           MODE=$(cat config/mode.txt | tr -d '[:space:]')
-          echo "Mode: $MODE"
           if [ "$MODE" = "script" ]; then
             cp config/frida_script.json decompiled/lib/armeabi-v7a/libfrida-gadget.config.so
             cp config/default_script.js  decompiled/lib/armeabi-v7a/libfrida-gadget.config.so.js
-            echo "Script mode aktif"
           else
             cp config/frida_listen.json decompiled/lib/armeabi-v7a/libfrida-gadget.config.so
-            echo "Listen mode aktif port 27042"
           fi
-
-      - name: Preview hasil inject
-        run: |
-          echo "=== Sekitar inject point ==="
-          grep -n -A 5 "frida-gadget" \
-            decompiled/smali/com/sampmobilerp/launcher/SplashActivity.smali
 
       - name: Recompile APK
         run: |
           apktool b decompiled -o patched_unsigned.apk
-          echo "Recompile: $(du -sh patched_unsigned.apk)"
 
       - name: Generate keystore
         run: |
@@ -142,11 +143,10 @@ jobs:
             --ks test.keystore --ks-key-alias testkey \
             --ks-pass pass:testpass --key-pass pass:testpass \
             --out patched_signed.apk patched_aligned.apk
-          echo "Signed: $(du -sh patched_signed.apk)"
 
       - name: Verify APK
         run: |
-          apksigner verify patched_signed.apk && echo "[+] APK valid!" || echo "[-] invalid"
+          apksigner verify patched_signed.apk && echo "[+] Valid!" || echo "[-] Invalid"
 
       - name: Upload patched APK
         uses: actions/upload-artifact@v4
@@ -155,7 +155,7 @@ jobs:
           path: patched_signed.apk
           retention-days: 7
 
-      - name: Upload SplashActivity smali (debug)
+      - name: Upload smali debug
         uses: actions/upload-artifact@v4
         with:
           name: SplashActivity-smali
