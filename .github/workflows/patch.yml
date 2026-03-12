@@ -34,126 +34,101 @@ jobs:
           echo '#!/bin/bash' > /usr/local/bin/apktool
           echo 'java -jar /usr/local/bin/apktool.jar "$@"' >> /usr/local/bin/apktool
           chmod +x /usr/local/bin/apktool
-          apktool --version
 
       - name: Download Frida Gadget (armeabi-v7a)
         run: |
           FRIDA_VER=$(curl -s https://api.github.com/repos/frida/frida/releases/latest \
             | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
           echo "Frida version: $FRIDA_VER"
-
           curl -L -o frida-gadget.so.xz \
             "https://github.com/frida/frida/releases/download/${FRIDA_VER}/frida-gadget-${FRIDA_VER}-android-arm.so.xz"
-
           xz -d frida-gadget.so.xz
           mv frida-gadget.so libfrida-gadget.so
-          echo "Gadget: $(du -sh libfrida-gadget.so)"
 
       - name: Decompile APK
         run: |
           apktool d input/target.apk -o decompiled -f
-          echo "Decompile OK"
 
-      - name: Inject loadLibrary ke MainActivity
+      - name: Inject loadLibrary ke SplashActivity
         run: |
           python3 << 'PYTHON'
           import os
 
-          # Path MainActivity SAMP - sudah diketahui pasti
-          target = "decompiled/smali/com/sampmobilerp/launcher/MainActivity.smali"
+          target = "decompiled/smali/com/sampmobilerp/launcher/SplashActivity.smali"
 
           if not os.path.exists(target):
               print(f"ERROR: {target} tidak ditemukan!")
               exit(1)
 
           with open(target, 'r') as f:
-              lines = f.readlines()
+              content = f.read()
 
-          LOAD_LIB = (
+          # Inject tepat setelah invoke-super onCreate yang spesifik ini
+          SUPER_LINE = "    invoke-super {p0, p1}, Landroidx/fragment/app/v;->onCreate(Landroid/os/Bundle;)V"
+          INJECT = (
+              "\n"
+              "    # >>> Frida Gadget injection <<<\n"
               '    const-string v0, "frida-gadget"\n'
-              '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n'
+              "    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n"
+              "    # >>> End injection <<<\n"
           )
 
-          new_lines = []
-          injected = False
-          in_oncreate = False
-          brace_found = False
-
-          for i, line in enumerate(lines):
-              new_lines.append(line)
-              stripped = line.strip()
-
-              # Deteksi method onCreate
-              if '.method' in stripped and 'onCreate' in stripped and not injected:
-                  in_oncreate = True
-
-              if in_oncreate and not injected:
-                  # Inject setelah .prologue, atau setelah invoke-super
-                  if '.prologue' in stripped:
-                      new_lines.append(LOAD_LIB)
-                      injected = True
-                      print(f"[+] Injected setelah .prologue di baris {i+1}")
-                  elif 'invoke-super' in stripped and 'onCreate' in stripped:
-                      new_lines.append(LOAD_LIB)
-                      injected = True
-                      print(f"[+] Injected setelah invoke-super di baris {i+1}")
-
-              # Reset saat method selesai
-              if in_oncreate and '.end method' in stripped:
-                  in_oncreate = False
-
-          if not injected:
-              print("WARNING: Tidak bisa inject otomatis, cek smali manual")
+          if SUPER_LINE not in content:
+              print("ERROR: invoke-super target tidak ditemukan di smali!")
+              print("Coba cari manual...")
+              # Fallback: cari invoke-super onCreate apapun
+              import re
+              matches = re.findall(r'    invoke-super.*->onCreate.*', content)
+              print(f"invoke-super onCreate yang ada: {matches}")
               exit(1)
 
-          with open(target, 'w') as f:
-              f.writelines(new_lines)
-
-          print("[+] Injection selesai!")
+          if 'frida-gadget' in content:
+              print("WARNING: frida-gadget sudah ada di smali, skip inject")
+          else:
+              new_content = content.replace(SUPER_LINE, SUPER_LINE + INJECT, 1)
+              with open(target, 'w') as f:
+                  f.write(new_content)
+              print(f"[+] Inject berhasil setelah invoke-super onCreate!")
 
           # Verifikasi
           with open(target, 'r') as f:
-              content = f.read()
-          if 'frida-gadget' in content:
-              print("[+] Verifikasi OK - frida-gadget ada di smali")
+              verify = f.read()
+          if 'frida-gadget' in verify:
+              print("[+] Verifikasi OK!")
           else:
-              print("[-] Verifikasi GAGAL")
+              print("[-] Verifikasi GAGAL!")
               exit(1)
           PYTHON
 
-      - name: Copy Frida Gadget ke lib/armeabi-v7a
+      - name: Copy Frida Gadget ke lib
         run: |
           mkdir -p decompiled/lib/armeabi-v7a
           cp libfrida-gadget.so decompiled/lib/armeabi-v7a/libfrida-gadget.so
-          echo "Gadget copied ke lib/armeabi-v7a/"
           ls -la decompiled/lib/armeabi-v7a/
 
-      - name: Setup Frida config (listen/script)
+      - name: Setup Frida config
         run: |
           MODE=$(cat config/mode.txt | tr -d '[:space:]')
           echo "Mode: $MODE"
           if [ "$MODE" = "script" ]; then
-            cp config/frida_script.json \
-               decompiled/lib/armeabi-v7a/libfrida-gadget.config.so
-            cp config/default_script.js \
-               decompiled/lib/armeabi-v7a/libfrida-gadget.config.so.js
+            cp config/frida_script.json decompiled/lib/armeabi-v7a/libfrida-gadget.config.so
+            cp config/default_script.js  decompiled/lib/armeabi-v7a/libfrida-gadget.config.so.js
             echo "Script mode aktif"
           else
-            cp config/frida_listen.json \
-               decompiled/lib/armeabi-v7a/libfrida-gadget.config.so
-            echo "Listen mode aktif (port 27042)"
+            cp config/frida_listen.json decompiled/lib/armeabi-v7a/libfrida-gadget.config.so
+            echo "Listen mode aktif port 27042"
           fi
 
-      - name: Tampilkan smali hasil inject (debug)
+      - name: Preview hasil inject
         run: |
-          echo "=== 30 baris pertama onCreate ==="
-          grep -A 30 "method.*onCreate" \
-            decompiled/smali/com/sampmobilerp/launcher/MainActivity.smali | head -35
+          echo "=== Sekitar inject point ==="
+          grep -n -A 5 "frida-gadget" \
+            decompiled/smali/com/sampmobilerp/launcher/SplashActivity.smali
 
       - name: Recompile APK
         run: |
           apktool b decompiled -o patched_unsigned.apk
-          echo "Recompile OK: $(du -sh patched_unsigned.apk)"
+          echo "Recompile: $(du -sh patched_unsigned.apk)"
 
       - name: Generate keystore
         run: |
@@ -172,9 +147,9 @@ jobs:
             --out patched_signed.apk patched_aligned.apk
           echo "Signed: $(du -sh patched_signed.apk)"
 
-      - name: Verify
+      - name: Verify APK
         run: |
-          apksigner verify patched_signed.apk && echo "[+] APK valid!" || echo "[-] APK invalid"
+          apksigner verify patched_signed.apk && echo "[+] APK valid!" || echo "[-] invalid"
 
       - name: Upload patched APK
         uses: actions/upload-artifact@v4
@@ -183,9 +158,9 @@ jobs:
           path: patched_signed.apk
           retention-days: 7
 
-      - name: Upload smali inject (debug)
+      - name: Upload SplashActivity smali (debug)
         uses: actions/upload-artifact@v4
         with:
-          name: MainActivity-smali
-          path: decompiled/smali/com/sampmobilerp/launcher/MainActivity.smali
+          name: SplashActivity-smali
+          path: decompiled/smali/com/sampmobilerp/launcher/SplashActivity.smali
           retention-days: 3
