@@ -3,9 +3,6 @@ name: Patch SAMP APK - Frida Gadget
 on:
   push:
     branches: [ main, master ]
-    paths:
-      - 'input/**.apk'
-      - 'config/**'
   workflow_dispatch:
 
 jobs:
