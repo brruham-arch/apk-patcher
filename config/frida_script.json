@@ -1,0 +1,7 @@
+{
+  "interaction": {
+    "type": "script",
+    "path": "./libfrida-gadget.config.so.js",
+    "on_change": "reload"
+  }
+}

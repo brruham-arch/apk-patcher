@@ -1,0 +1,191 @@
+name: Patch SAMP APK - Frida Gadget
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'input/**.apk'
+      - 'config/**'
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y zipalign apksigner aapt unzip python3 xz-utils
+
+      - name: Download apktool
+        run: |
+          curl -L -o /usr/local/bin/apktool.jar \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar"
+          echo '#!/bin/bash' > /usr/local/bin/apktool
+          echo 'java -jar /usr/local/bin/apktool.jar "$@"' >> /usr/local/bin/apktool
+          chmod +x /usr/local/bin/apktool
+          apktool --version
+
+      - name: Download Frida Gadget (armeabi-v7a)
+        run: |
+          FRIDA_VER=$(curl -s https://api.github.com/repos/frida/frida/releases/latest \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+          echo "Frida version: $FRIDA_VER"
+
+          curl -L -o frida-gadget.so.xz \
+            "https://github.com/frida/frida/releases/download/${FRIDA_VER}/frida-gadget-${FRIDA_VER}-android-arm.so.xz"
+
+          xz -d frida-gadget.so.xz
+          mv frida-gadget.so libfrida-gadget.so
+          echo "Gadget: $(du -sh libfrida-gadget.so)"
+
+      - name: Decompile APK
+        run: |
+          apktool d input/target.apk -o decompiled -f
+          echo "Decompile OK"
+
+      - name: Inject loadLibrary ke MainActivity
+        run: |
+          python3 << 'PYTHON'
+          import os
+
+          # Path MainActivity SAMP - sudah diketahui pasti
+          target = "decompiled/smali/com/sampmobilerp/launcher/MainActivity.smali"
+
+          if not os.path.exists(target):
+              print(f"ERROR: {target} tidak ditemukan!")
+              exit(1)
+
+          with open(target, 'r') as f:
+              lines = f.readlines()
+
+          LOAD_LIB = (
+              '    const-string v0, "frida-gadget"\n'
+              '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n'
+          )
+
+          new_lines = []
+          injected = False
+          in_oncreate = False
+          brace_found = False
+
+          for i, line in enumerate(lines):
+              new_lines.append(line)
+              stripped = line.strip()
+
+              # Deteksi method onCreate
+              if '.method' in stripped and 'onCreate' in stripped and not injected:
+                  in_oncreate = True
+
+              if in_oncreate and not injected:
+                  # Inject setelah .prologue, atau setelah invoke-super
+                  if '.prologue' in stripped:
+                      new_lines.append(LOAD_LIB)
+                      injected = True
+                      print(f"[+] Injected setelah .prologue di baris {i+1}")
+                  elif 'invoke-super' in stripped and 'onCreate' in stripped:
+                      new_lines.append(LOAD_LIB)
+                      injected = True
+                      print(f"[+] Injected setelah invoke-super di baris {i+1}")
+
+              # Reset saat method selesai
+              if in_oncreate and '.end method' in stripped:
+                  in_oncreate = False
+
+          if not injected:
+              print("WARNING: Tidak bisa inject otomatis, cek smali manual")
+              exit(1)
+
+          with open(target, 'w') as f:
+              f.writelines(new_lines)
+
+          print("[+] Injection selesai!")
+
+          # Verifikasi
+          with open(target, 'r') as f:
+              content = f.read()
+          if 'frida-gadget' in content:
+              print("[+] Verifikasi OK - frida-gadget ada di smali")
+          else:
+              print("[-] Verifikasi GAGAL")
+              exit(1)
+          PYTHON
+
+      - name: Copy Frida Gadget ke lib/armeabi-v7a
+        run: |
+          mkdir -p decompiled/lib/armeabi-v7a
+          cp libfrida-gadget.so decompiled/lib/armeabi-v7a/libfrida-gadget.so
+          echo "Gadget copied ke lib/armeabi-v7a/"
+          ls -la decompiled/lib/armeabi-v7a/
+
+      - name: Setup Frida config (listen/script)
+        run: |
+          MODE=$(cat config/mode.txt | tr -d '[:space:]')
+          echo "Mode: $MODE"
+          if [ "$MODE" = "script" ]; then
+            cp config/frida_script.json \
+               decompiled/lib/armeabi-v7a/libfrida-gadget.config.so
+            cp config/default_script.js \
+               decompiled/lib/armeabi-v7a/libfrida-gadget.config.so.js
+            echo "Script mode aktif"
+          else
+            cp config/frida_listen.json \
+               decompiled/lib/armeabi-v7a/libfrida-gadget.config.so
+            echo "Listen mode aktif (port 27042)"
+          fi
+
+      - name: Tampilkan smali hasil inject (debug)
+        run: |
+          echo "=== 30 baris pertama onCreate ==="
+          grep -A 30 "method.*onCreate" \
+            decompiled/smali/com/sampmobilerp/launcher/MainActivity.smali | head -35
+
+      - name: Recompile APK
+        run: |
+          apktool b decompiled -o patched_unsigned.apk
+          echo "Recompile OK: $(du -sh patched_unsigned.apk)"
+
+      - name: Generate keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore test.keystore -alias testkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass testpass -keypass testpass \
+            -dname "CN=Test,OU=Test,O=Test,L=Test,S=Test,C=US"
+
+      - name: Zipalign + Sign
+        run: |
+          zipalign -v 4 patched_unsigned.apk patched_aligned.apk
+          apksigner sign \
+            --ks test.keystore --ks-key-alias testkey \
+            --ks-pass pass:testpass --key-pass pass:testpass \
+            --out patched_signed.apk patched_aligned.apk
+          echo "Signed: $(du -sh patched_signed.apk)"
+
+      - name: Verify
+        run: |
+          apksigner verify patched_signed.apk && echo "[+] APK valid!" || echo "[-] APK invalid"
+
+      - name: Upload patched APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: samp-frida-patched
+          path: patched_signed.apk
+          retention-days: 7
+
+      - name: Upload smali inject (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: MainActivity-smali
+          path: decompiled/smali/com/sampmobilerp/launcher/MainActivity.smali
+          retention-days: 3
